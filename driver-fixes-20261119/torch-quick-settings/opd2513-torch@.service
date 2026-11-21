@@ -1,0 +1,13 @@
+[Unit]
+Description=OnePlus Pad 3 Pro flashlight control
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/opd2513-torch serve
+StandardInput=socket
+StandardOutput=journal
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+TimeoutStartSec=5

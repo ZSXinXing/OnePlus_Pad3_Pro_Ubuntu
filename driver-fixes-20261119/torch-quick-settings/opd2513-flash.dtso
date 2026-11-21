@@ -1,0 +1,26 @@
+/dts-v1/;
+/plugin/;
+
+&{/soc@0/arbiter@c400000/spmi@c426000/pmic@1/led-controller@ee00} {
+    status = "okay";
+
+    led-0 {
+        function = "flash";
+        function-enumerator = <0>;
+        color = <6>; /* LED_COLOR_ID_YELLOW */
+        led-sources = <1 4>;
+        led-max-microamp = <500000>;
+        flash-max-microamp = <2000000>;
+        flash-max-timeout-us = <1280000>;
+    };
+
+    led-1 {
+        function = "flash";
+        function-enumerator = <1>;
+        color = <0>; /* LED_COLOR_ID_WHITE */
+        led-sources = <2 3>;
+        led-max-microamp = <500000>;
+        flash-max-microamp = <2000000>;
+        flash-max-timeout-us = <1280000>;
+    };
+};

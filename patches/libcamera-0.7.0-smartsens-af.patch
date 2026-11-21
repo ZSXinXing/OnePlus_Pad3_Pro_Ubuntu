@@ -1,0 +1,610 @@
+diff --git a/include/libcamera/internal/software_isp/swisp_stats.h b/include/libcamera/internal/software_isp/swisp_stats.h
+index d9d0d9b..f923ece 100644
+--- a/include/libcamera/internal/software_isp/swisp_stats.h
++++ b/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -31,6 +31,14 @@ struct SwIspStats {
+ 	 * \brief Sums of colour channels of all the sampled pixels
+ 	 */
+ 	RGB<uint64_t> sum_;
++	/**
++	 * \brief Sum of horizontal luminance gradients used for focus measurement
++	 */
++	uint64_t focusSum;
++	/**
++	 * \brief Number of gradients accumulated in focusSum
++	 */
++	uint32_t focusSamples;
+ 	/**
+ 	 * \brief Number of bins in the yHistogram
+ 	 */
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+index e3e3e53..4ef908c 100644
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -677,6 +677,19 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("ov2740", CameraSensorHelperOv2740)
+ 
++/* Both SmartSens drivers expose linear total gain in units of 1/128. */
++class CameraSensorHelperSmartSensLinear : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperSmartSensLinear()
++	{
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 128 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("sc1320cs", CameraSensorHelperSmartSensLinear)
++class CameraSensorHelperSc820cs : public CameraSensorHelperSmartSensLinear {};
++REGISTER_CAMERA_SENSOR_HELPER("sc820cs", CameraSensorHelperSc820cs)
++
+ class CameraSensorHelperOv4689 : public CameraSensorHelper
+ {
+ public:
+diff --git a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
+index 6bef597..bd770e4 100644
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -5,7 +5,9 @@
+  * Simple Software Image Processing Algorithm module
+  */
+ 
++#include <algorithm>
+ #include <chrono>
++#include <limits>
+ #include <stdint.h>
+ #include <sys/mman.h>
+ 
+@@ -177,6 +179,9 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 		stats_ = static_cast<SwIspStats *>(mem);
+ 	}
+ 
++	context_.ctrlMap[&controls::FocusFoM] = ControlInfo(
++		0, std::numeric_limits<int32_t>::max(), 0);
++
+ 	ControlInfoMap::Map ctrlMap = context_.ctrlMap;
+ 	*ipaControls = ControlInfoMap(std::move(ctrlMap), controls::controls);
+ 
+@@ -227,7 +232,9 @@ int IPASoftSimple::configure(const IPAConfigInfo &configInfo)
+ 	if (camHelper_) {
+ 		context_.configuration.agc.againMin = camHelper_->gain(againMin);
+ 		context_.configuration.agc.againMax = camHelper_->gain(againMax);
+-		context_.configuration.agc.again10 = camHelper_->gain(1.0);
++		/* Gain is already expressed as a physical multiplier here. */
++		context_.configuration.agc.again10 =
++			std::max(1.0, context_.configuration.agc.againMin);
+ 		context_.configuration.agc.againMinStep =
+ 			(context_.configuration.agc.againMax -
+ 			 context_.configuration.agc.againMin) /
+@@ -309,6 +316,26 @@ void IPASoftSimple::processStats(const uint32_t frame,
+ 	ControlList metadata(controls::controls);
+ 	for (auto const &algo : algorithms())
+ 		algo->process(context_, frame, frameContext, stats_, metadata);
++	if (stats_->valid && stats_->focusSamples) {
++		/*
++		 * The gradient sum scales with the image brightness: divide
++		 * by the mean luminance so that an exposure change alone
++		 * does not look like a focus change and restart a scan.
++		 */
++		uint64_t histSum = 0, histWeighted = 0;
++		for (unsigned int i = 0; i < SwIspStats::kYHistogramSize; i++) {
++			histSum += stats_->yHistogram[i];
++			histWeighted += static_cast<uint64_t>(stats_->yHistogram[i]) * (2 * i + 1);
++		}
++		/* the mean bin in half-bin units (1 .. 127); 64 = mid grey */
++		const uint64_t meanHalfBins =
++			histSum ? std::max<uint64_t>(1, histWeighted / histSum) : 64;
++		const uint64_t focus = stats_->focusSum * 1024 * 64 /
++				       (static_cast<uint64_t>(stats_->focusSamples) * meanHalfBins);
++		metadata.set(controls::FocusFoM,
++			     static_cast<int32_t>(std::min<uint64_t>(
++				     focus, std::numeric_limits<int32_t>::max())));
++	}
+ 	metadataReady.emit(frame, metadata);
+ 
+ 	/* Sanity check */
+diff --git a/src/libcamera/control_ids_draft.yaml b/src/libcamera/control_ids_draft.yaml
+index 03309ee..861b55f 100644
+--- a/src/libcamera/control_ids_draft.yaml
++++ b/src/libcamera/control_ids_draft.yaml
+@@ -294,4 +294,17 @@ controls:
+         Currently identical to ANDROID_STATISTICS_FACE_IDS.
+       size: [n]
+ 
++  - FocusAbsolute:
++      type: int32_t
++      direction: inout
++      description: |
++        Absolute focus actuator position in the native units exposed by the
++        V4L2 lens subdevice.
++
++        This control is intended for lens actuators that have not yet been
++        calibrated to the dioptre units required by the LensPosition control.
++        The valid range and default value are copied from
++        V4L2_CID_FOCUS_ABSOLUTE. Applications should not compare values across
++        different camera modules.
++
+ ...
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 4a0b9f5..1d9969a 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <algorithm>
+ #include <iterator>
++#include <limits>
+ #include <list>
+ #include <map>
+ #include <memory>
+@@ -15,6 +16,7 @@
+ #include <queue>
+ #include <set>
+ #include <stdint.h>
++#include <stdio.h>
+ #include <string.h>
+ #include <string>
+ #include <unordered_map>
+@@ -24,6 +26,7 @@
+ #include <linux/media-bus-format.h>
+ 
+ #include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
+ 
+ #include <libcamera/camera.h>
+ #include <libcamera/color_space.h>
+@@ -33,6 +36,7 @@
+ #include <libcamera/stream.h>
+ 
+ #include "libcamera/internal/camera.h"
++#include "libcamera/internal/camera_lens.h"
+ #include "libcamera/internal/camera_manager.h"
+ #include "libcamera/internal/camera_sensor.h"
+ #include "libcamera/internal/camera_sensor_properties.h"
+@@ -292,6 +296,10 @@ public:
+ 			 Transform transform = Transform::Identity);
+ 	void imageBufferReady(FrameBuffer *buffer);
+ 	void clearIncompleteRequests();
++	int handleFocusControls(Request *request);
++	void updateAutoFocus(Request *request, uint32_t frame,
++			     const ControlList &metadata);
++	void resetAutoFocus();
+ 
+ 	unsigned int streamIndex(const Stream *stream) const
+ 	{
+@@ -341,6 +349,12 @@ public:
+ 	 */
+ 	std::list<Entity> entities_;
+ 	std::unique_ptr<CameraSensor> sensor_;
++	CameraLens *focusLens_;
++	int32_t focusPosition_;
++	int32_t focusMinimum_;
++	int32_t focusMaximum_;
++	int32_t afScanMinimum_ = 0;
++	int32_t afScanMaximum_ = 0;
+ 	V4L2VideoDevice *video_;
+ 	V4L2Subdevice *frameStartEmitter_;
+ 
+@@ -362,6 +376,42 @@ public:
+ 	SimpleFrames frameInfo_;
+ 
+ private:
++	enum class AfScanStage {
++		Idle,
++		Coarse,
++		Fine,
++	};
++
++	int moveFocus(int32_t position);
++	int startAutoFocus();
++	void cancelAutoFocus();
++	void advanceAutoFocus(int32_t focusFoM);
++	void writeFocusMetadata(Request *request);
++
++	/*
++	 * A focus figure of merit is only used from a frame at least this
++	 * many frames after the one whose statistics moved the lens: the
++	 * frames in between may have been exposed while the lens moved.
++	 */
++	static constexpr uint32_t kAfSettleFrames = 2;
++
++	int32_t afDefaultMode_;
++	bool afStartPending_;
++	uint32_t afCurrentFrame_;
++	uint32_t afMoveFrame_;
++	bool afMoved_;
++	int32_t afMode_;
++	int32_t afState_;
++	AfScanStage afScanStage_;
++	int32_t afScanPosition_;
++	int32_t afScanEnd_;
++	int32_t afScanStep_;
++	int32_t afCoarseStep_;
++	int32_t afBestPosition_;
++	int32_t afBestFoM_;
++	int32_t afLockedFoM_;
++	unsigned int afLowFocusFrames_;
++
+ 	void tryPipeline(unsigned int code, const Size &size);
+ 	static std::vector<const MediaPad *> routedSourcePads(MediaPad *sink);
+ 
+@@ -469,7 +519,15 @@ private:
+ SimpleCameraData::SimpleCameraData(SimplePipelineHandler *pipe,
+ 				   unsigned int numStreams,
+ 				   MediaEntity *sensor)
+-	: Camera::Private(pipe), streams_(numStreams), rawStream_(nullptr)
++	: Camera::Private(pipe), streams_(numStreams), rawStream_(nullptr),
++	  focusLens_(nullptr), focusPosition_(0), focusMinimum_(0),
++	  focusMaximum_(0), afDefaultMode_(controls::AfModeManual),
++	  afStartPending_(false), afCurrentFrame_(0), afMoveFrame_(0),
++	  afMoved_(false), afMode_(controls::AfModeManual),
++	  afState_(controls::AfStateIdle), afScanStage_(AfScanStage::Idle),
++	  afScanPosition_(0), afScanEnd_(0), afScanStep_(0), afCoarseStep_(0),
++	  afBestPosition_(0), afBestFoM_(std::numeric_limits<int32_t>::min()),
++	  afLockedFoM_(0), afLowFocusFrames_(0)
+ {
+ 	/*
+ 	 * Find the shortest path from the camera sensor to a video capture
+@@ -664,6 +722,79 @@ int SimpleCameraData::init()
+ 
+ 	properties_ = sensor_->properties();
+ 
++	/*
++	 * Expose the native actuator position until a module-specific conversion
++	 * to the dioptre units used by LensPosition has been calibrated.
++	 */
++	focusLens_ = sensor_->focusLens();
++	if (focusLens_) {
++		auto focus = focusLens_->controls().find(V4L2_CID_FOCUS_ABSOLUTE);
++		if (focus == focusLens_->controls().end()) {
++			LOG(SimplePipeline, Warning)
++				<< "Focus lens has no V4L2_CID_FOCUS_ABSOLUTE control";
++			focusLens_ = nullptr;
++		} else {
++			ControlInfoMap::Map controlsMap(controlInfo_.begin(),
++							 controlInfo_.end());
++			const ControlValue manual(controls::AfModeManual);
++			const ControlValue triggerStart(controls::AfTriggerStart);
++			const ControlValue idle(controls::AfStateIdle);
++
++			/*
++			 * LIBCAMERA_SIMPLE_AF_MODE=manual|auto|continuous picks the
++			 * mode used until an application sets AfMode. Camera
++			 * applications that use libcamera through PipeWire or
++			 * GStreamer never set it, so continuous is the default.
++			 */
++			afDefaultMode_ = controls::AfModeContinuous;
++			const char *afEnv = utils::secure_getenv("LIBCAMERA_SIMPLE_AF_MODE");
++			if (afEnv) {
++				std::string m(afEnv);
++				if (m == "manual")
++					afDefaultMode_ = controls::AfModeManual;
++				else if (m == "auto")
++					afDefaultMode_ = controls::AfModeAuto;
++			}
++			afMode_ = afDefaultMode_;
++
++			controlsMap.emplace(&controls::AfMode,
++					    ControlInfo(controls::AfModeValues,
++							ControlValue(afDefaultMode_)));
++			controlsMap.emplace(&controls::AfTrigger,
++					    ControlInfo(controls::AfTriggerValues,
++							triggerStart));
++			controlsMap.emplace(&controls::AfState,
++					    ControlInfo(controls::AfStateValues, idle));
++			controlsMap.emplace(&controls::draft::FocusAbsolute,
++					    focus->second);
++			controlInfo_ = ControlInfoMap(std::move(controlsMap),
++						  controls::controls);
++			focusMinimum_ = focus->second.min().get<int32_t>();
++			focusMaximum_ = focus->second.max().get<int32_t>();
++			focusPosition_ = focus->second.def().get<int32_t>();
++
++			/*
++			 * LIBCAMERA_SIMPLE_AF_RANGE=<min>-<max> narrows the scan to a
++			 * module's calibrated infinity .. macro positions (native
++			 * actuator units). Manual positioning keeps the full range.
++			 */
++			const char *rangeEnv = utils::secure_getenv("LIBCAMERA_SIMPLE_AF_RANGE");
++			int lo, hi;
++			if (rangeEnv && sscanf(rangeEnv, "%d-%d", &lo, &hi) == 2 &&
++			    lo >= focusMinimum_ && hi <= focusMaximum_ && lo < hi) {
++				afScanMinimum_ = lo;
++				afScanMaximum_ = hi;
++			} else {
++				afScanMinimum_ = focusMinimum_;
++				afScanMaximum_ = focusMaximum_;
++			}
++			LOG(SimplePipeline, Info)
++				<< "Focus lens " << focusMinimum_ << ".." << focusMaximum_
++				<< ", autofocus scan " << afScanMinimum_ << ".."
++				<< afScanMaximum_ << ", default AfMode " << afDefaultMode_;
++		}
++	}
++
+ 	/* Find the first subdev that can generate a frame start signal, if any. */
+ 	frameStartEmitter_ = nullptr;
+ 	for (const Entity &entity : entities_) {
+@@ -681,6 +812,200 @@ int SimpleCameraData::init()
+ 	return 0;
+ }
+ 
++int SimpleCameraData::moveFocus(int32_t position)
++{
++	position = std::clamp(position, focusMinimum_, focusMaximum_);
++	int ret = focusLens_->setFocusPosition(position);
++	if (ret < 0) {
++		LOG(SimplePipeline, Error)
++			<< "Failed to move focus lens to " << position << ": " << ret;
++		return ret;
++	}
++
++	focusPosition_ = position;
++	afMoveFrame_ = afCurrentFrame_;
++	afMoved_ = true;
++	return 0;
++}
++
++int SimpleCameraData::startAutoFocus()
++{
++	afCoarseStep_ = std::max(1, (afScanMaximum_ - afScanMinimum_ + 9) / 10);
++	afScanStage_ = AfScanStage::Coarse;
++	afScanPosition_ = afScanMinimum_;
++	afScanEnd_ = afScanMaximum_;
++	afScanStep_ = afCoarseStep_;
++	afBestPosition_ = focusPosition_;
++	afBestFoM_ = std::numeric_limits<int32_t>::min();
++	afLowFocusFrames_ = 0;
++
++	int ret = moveFocus(afScanPosition_);
++	if (ret < 0) {
++		afScanStage_ = AfScanStage::Idle;
++		afState_ = controls::AfStateFailed;
++		return ret;
++	}
++
++	afState_ = controls::AfStateScanning;
++	return 0;
++}
++
++void SimpleCameraData::cancelAutoFocus()
++{
++	afScanStage_ = AfScanStage::Idle;
++	afState_ = controls::AfStateIdle;
++	afLowFocusFrames_ = 0;
++}
++
++void SimpleCameraData::advanceAutoFocus(int32_t focusFoM)
++{
++	if (afScanStage_ == AfScanStage::Idle) {
++		if (afMode_ != controls::AfModeContinuous ||
++		    afState_ != controls::AfStateFocused || afLockedFoM_ <= 0)
++			return;
++
++		if (static_cast<int64_t>(focusFoM) * 100 <
++		    static_cast<int64_t>(afLockedFoM_) * 65)
++			afLowFocusFrames_++;
++		else {
++			afLowFocusFrames_ = 0;
++			afLockedFoM_ = std::max(afLockedFoM_, focusFoM);
++		}
++
++		if (afLowFocusFrames_ >= 3)
++			startAutoFocus();
++		return;
++	}
++
++	if (focusFoM > afBestFoM_) {
++		afBestFoM_ = focusFoM;
++		afBestPosition_ = afScanPosition_;
++	}
++
++	if (afScanPosition_ < afScanEnd_) {
++		afScanPosition_ = std::min(afScanEnd_,
++					   afScanPosition_ + afScanStep_);
++		if (moveFocus(afScanPosition_) < 0) {
++			afScanStage_ = AfScanStage::Idle;
++			afState_ = controls::AfStateFailed;
++		}
++		return;
++	}
++
++	if (afScanStage_ == AfScanStage::Coarse) {
++		const int32_t coarseBest = afBestPosition_;
++		afScanStage_ = AfScanStage::Fine;
++		afScanPosition_ = std::max(afScanMinimum_,
++					   coarseBest - afCoarseStep_);
++		afScanEnd_ = std::min(afScanMaximum_,
++				      coarseBest + afCoarseStep_);
++		afScanStep_ = std::max(1, afCoarseStep_ / 4);
++		afBestFoM_ = std::numeric_limits<int32_t>::min();
++		afBestPosition_ = coarseBest;
++		if (moveFocus(afScanPosition_) < 0) {
++			afScanStage_ = AfScanStage::Idle;
++			afState_ = controls::AfStateFailed;
++		}
++		return;
++	}
++
++	afScanStage_ = AfScanStage::Idle;
++	afLockedFoM_ = std::max(0, afBestFoM_);
++	if (moveFocus(afBestPosition_) < 0) {
++		afState_ = controls::AfStateFailed;
++		return;
++	}
++
++	afState_ = afLockedFoM_ > 0 ? controls::AfStateFocused
++					    : controls::AfStateFailed;
++	LOG(SimplePipeline, Info)
++		<< "Autofocus selected native position " << afBestPosition_
++		<< " with FoM " << afLockedFoM_;
++}
++
++void SimpleCameraData::writeFocusMetadata(Request *request)
++{
++	ControlList &metadata = request->_d()->metadata();
++	metadata.set(controls::AfMode, afMode_);
++	metadata.set(controls::AfState, afState_);
++	metadata.set(controls::draft::FocusAbsolute, focusPosition_);
++}
++
++int SimpleCameraData::handleFocusControls(Request *request)
++{
++	if (!focusLens_)
++		return 0;
++
++	if (afStartPending_) {
++		afStartPending_ = false;
++		if (afMode_ == controls::AfModeContinuous) {
++			int ret = startAutoFocus();
++			if (ret < 0)
++				return ret;
++		}
++	}
++
++	const auto &mode = request->controls().get(controls::AfMode);
++	if (mode && *mode != afMode_) {
++		afMode_ = *mode;
++		cancelAutoFocus();
++		if (afMode_ == controls::AfModeContinuous) {
++			int ret = startAutoFocus();
++			if (ret < 0)
++				return ret;
++		}
++	}
++
++	const auto &trigger = request->controls().get(controls::AfTrigger);
++	if (trigger && afMode_ == controls::AfModeAuto) {
++		if (*trigger == controls::AfTriggerStart &&
++		    afState_ != controls::AfStateScanning) {
++			int ret = startAutoFocus();
++			if (ret < 0)
++				return ret;
++		} else if (*trigger == controls::AfTriggerCancel) {
++			cancelAutoFocus();
++		}
++	}
++
++	const auto &position =
++		request->controls().get(controls::draft::FocusAbsolute);
++	if (position && afMode_ == controls::AfModeManual) {
++		int ret = moveFocus(*position);
++		if (ret < 0)
++			return ret;
++	}
++
++	writeFocusMetadata(request);
++	return 0;
++}
++
++void SimpleCameraData::resetAutoFocus()
++{
++	cancelAutoFocus();
++	afLockedFoM_ = 0;
++	afMoved_ = false;
++	afStartPending_ = focusLens_ != nullptr;
++}
++
++void SimpleCameraData::updateAutoFocus(Request *request, uint32_t frame,
++				       const ControlList &metadata)
++{
++	afCurrentFrame_ = frame;
++	const int32_t framePosition =
++		request->_d()->metadata()
++			.get(controls::draft::FocusAbsolute)
++			.value_or(focusPosition_);
++	const auto &focusFoM = metadata.get(controls::FocusFoM);
++	const bool settled = !afMoved_ || frame >= afMoveFrame_ + kAfSettleFrames;
++	if (focusFoM && afMode_ != controls::AfModeManual && settled)
++		advanceAutoFocus(*focusFoM);
++
++	writeFocusMetadata(request);
++	request->_d()->metadata().set(controls::draft::FocusAbsolute,
++				    framePosition);
++}
++
+ /*
+  * Generate a list of supported pipeline configurations for a sensor media bus
+  * code and size.
+@@ -1037,6 +1362,7 @@ void SimpleCameraData::metadataReady(uint32_t frame, const ControlList &metadata
+ 		return;
+ 
+ 	info->request->_d()->metadata().merge(metadata);
++	updateAutoFocus(info->request, frame, metadata);
+ 	info->metadataProcessed = true;
+ 	tryCompleteRequest(info->request);
+ }
+@@ -1618,6 +1944,7 @@ int SimplePipelineHandler::exportFrameBuffers(Camera *camera, Stream *stream,
+ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlList *controls)
+ {
+ 	SimpleCameraData *data = cameraData(camera);
++	data->resetAutoFocus();
+ 	V4L2VideoDevice *video = data->video_;
+ 	V4L2Subdevice *frameStartEmitter = data->frameStartEmitter_;
+ 	int ret;
+@@ -1727,6 +2054,10 @@ int SimplePipelineHandler::queueRequestDevice(Camera *camera, Request *request)
+ 	SimpleCameraData *data = cameraData(camera);
+ 	int ret;
+ 
++	ret = data->handleFocusControls(request);
++	if (ret < 0)
++		return ret;
++
+ 	std::map<const Stream *, FrameBuffer *> buffers;
+ 	bool metadataRequired = false;
+ 
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index 5c3011a..cd4a53e 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -169,10 +169,14 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ #define SWSTATS_START_LINE_STATS(pixel_t) \
+ 	pixel_t r, g, g2, b;              \
+ 	uint64_t yVal;                    \
++	uint32_t previousY = 0;           \
++	bool havePreviousY = false;       \
+                                           \
+ 	uint64_t sumR = 0;                \
+ 	uint64_t sumG = 0;                \
+-	uint64_t sumB = 0;
++	uint64_t sumB = 0;                \
++	uint64_t focusSum = 0;            \
++	uint32_t focusSamples = 0;
+ 
+ #define SWSTATS_ACCUMULATE_LINE_STATS(div) \
+ 	sumR += r;                         \
+@@ -182,12 +186,24 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 	yVal = r * kRedYMul;               \
+ 	yVal += g * kGreenYMul;            \
+ 	yVal += b * kBlueYMul;             \
++	{                                          \
++		const uint32_t focusY = yVal / (256 * (div)); \
++		if (havePreviousY) {                 \
++			focusSum += focusY > previousY ? focusY - previousY \
++				 : previousY - focusY; \
++			focusSamples++;                    \
++		}                                      \
++		previousY = focusY;                  \
++		havePreviousY = true;                \
++	}                                          \
+ 	stats_.yHistogram[yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div))]++;
+ 
+ #define SWSTATS_FINISH_LINE_STATS() \
+ 	stats_.sum_.r() += sumR;    \
+ 	stats_.sum_.g() += sumG;    \
+-	stats_.sum_.b() += sumB;
++	stats_.sum_.b() += sumB;    \
++	stats_.focusSum += focusSum; \
++	stats_.focusSamples += focusSamples;
+ 
+ void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[])
+ {
+@@ -333,6 +349,8 @@ void SwStatsCpu::startFrame(uint32_t frame)
+ 		LOG(SwStatsCpu, Error) << "Calling startFrame() without setWindow()";
+ 
+ 	stats_.sum_ = RGB<uint64_t>({ 0, 0, 0 });
++	stats_.focusSum = 0;
++	stats_.focusSamples = 0;
+ 	stats_.yHistogram.fill(0);
+ }
+ 

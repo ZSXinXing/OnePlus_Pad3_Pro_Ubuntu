@@ -1,0 +1,65 @@
+diff --git a/sound/soc/codecs/tfa9865.c b/sound/soc/codecs/tfa9865.c
+index 97d1db2e7..901274eea 100644
+--- a/sound/soc/codecs/tfa9865.c
++++ b/sound/soc/codecs/tfa9865.c
+@@ -9,6 +9,7 @@
+ #include <linux/init.h>
+ #include <linux/i2c.h>
+ #include <linux/regmap.h>
++#include <linux/of.h>
+ #include <sound/soc.h>
+ #include <sound/tlv.h>
+ #include <sound/pcm_params.h>
+@@ -490,6 +491,39 @@ static int tfa9865_init(struct tfa9865_priv *tfa9865)
+ 	return 0;
+ }
+ 
++/* Restore the stock OPD2513 speaker container's TDM fields while powered down. */
++static int tfa9865_opd2513_init_tdm(struct tfa9865_priv *amp, unsigned int devindex)
++{
++	/* DT groups devices by bus, while the stock container interleaves the buses. */
++	static const unsigned int slots[] = { 0, 2, 4, 1, 3, 5 };
++	struct regmap *map = amp->regmap;
++	unsigned int slot, control;
++	int ret;
++
++	if (devindex >= ARRAY_SIZE(slots))
++		return -EINVAL;
++	slot = slots[devindex];
++	ret = regmap_read(map, TFA9865_DEVICE_CONTROL, &control);
++	if (ret)
++		return ret;
++	if (!(control & TFA9865_POWERDOWN_MASK) ||
++	    (control & BIT(TFA9865_ENBLAMP_SHIFT)))
++		return -EBUSY;
++
++	/* Eight 32-bit slots, 32-bit samples, and the factory clock alignment. */
++	ret = regmap_update_bits(map, 0x20, GENMASK(15, 4), 0x6f90);
++	if (ret)
++		return ret;
++
++	/* Enable sink 1 and source 0. The paired sink uses the adjacent slot. */
++	ret = regmap_update_bits(map, 0x21, GENMASK(15, 8) | BIT(4) | BIT(3),
++				 ((slot ^ 1) << 12) | (slot << 8) | BIT(4) | BIT(3));
++	if (ret)
++		return ret;
++
++	return regmap_update_bits(map, 0x22, GENMASK(3, 0), slot);
++}
++
+ static int tfa9865_i2c_probe(struct i2c_client *i2c)
+ {
+ 	const struct tfa9865_static_config *config;
+@@ -550,6 +584,12 @@ static int tfa9865_i2c_probe(struct i2c_client *i2c)
+ 		}
+ 	}
+ 
++	if (config == &tfa9865_iceland_config && of_machine_is_compatible("oneplus,opd2513")) {
++		ret = tfa9865_opd2513_init_tdm(tfa9865, devindex);
++		if (ret)
++			return dev_err_probe(tfa9865->dev, ret, "Failed to set factory TDM slots\n");
++	}
++
+ 	return devm_snd_soc_register_component(tfa9865->dev, &tfa9865_component,
+ 					       &tfa9865_dai, 1);
+ 

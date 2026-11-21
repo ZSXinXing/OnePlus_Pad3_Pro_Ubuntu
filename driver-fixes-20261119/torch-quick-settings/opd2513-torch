@@ -1,0 +1,60 @@
+#!/usr/bin/python3
+import socket
+import sys
+from pathlib import Path
+
+
+LED = Path('/sys/class/leds/white:flash-1/brightness')
+SOCKET = '/run/opd2513-torch.sock'
+VALUES = {'off': b'0', 'on': b'1'}
+# 26/255 of the OPD2513 white LED's 500 mA limit is 50 mA across two channels.
+LEVELS = {b'0': b'0', b'1': b'26'}
+
+
+def serve(connection, led=LED):
+    connection.settimeout(2)
+    try:
+        command = connection.recv(2)
+        if command not in LEVELS or connection.recv(1):
+            connection.sendall(b'ERR')
+            return
+        level = LEVELS[command]
+        led.write_bytes(level + b'\n')
+        if led.read_bytes().strip() != level:
+            connection.sendall(b'ERR')
+            return
+        connection.sendall(b'OK')
+    except OSError as exc:
+        print(f'Flashlight control: {exc}', file=sys.stderr)
+        try:
+            connection.sendall(b'ERR')
+        except OSError:
+            pass
+
+
+def request(command):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(3)
+        connection.connect(SOCKET)
+        connection.sendall(VALUES[command])
+        connection.shutdown(socket.SHUT_WR)
+        with connection.makefile('rb') as response:
+            if response.read(3) != b'OK':
+                raise OSError('flashlight state not confirmed')
+
+
+def main():
+    if len(sys.argv) != 2:
+        raise SystemExit(2)
+    command = sys.argv[1]
+    if command == 'serve':
+        with socket.socket(fileno=0) as connection:
+            serve(connection)
+    elif command in VALUES:
+        request(command)
+    else:
+        raise SystemExit(2)
+
+
+if __name__ == '__main__':
+    main()

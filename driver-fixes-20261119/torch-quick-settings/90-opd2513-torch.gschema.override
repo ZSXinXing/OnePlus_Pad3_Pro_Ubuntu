@@ -1,0 +1,2 @@
+[org.gnome.shell]
+enabled-extensions=['opd2513-torch@local']

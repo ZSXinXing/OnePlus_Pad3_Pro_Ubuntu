@@ -1,0 +1,12 @@
+[Unit]
+Description=OnePlus Pad 3 Pro flashlight control socket
+
+[Socket]
+ListenStream=/run/opd2513-torch.sock
+SocketGroup=video
+SocketMode=0660
+Accept=yes
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

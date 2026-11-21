@@ -1,0 +1,6 @@
+{
+  "uuid": "opd2513-torch@local",
+  "name": "OPD2513 Flashlight",
+  "description": "A single flashlight button in the Quick Settings header.",
+  "shell-version": ["50"]
+}

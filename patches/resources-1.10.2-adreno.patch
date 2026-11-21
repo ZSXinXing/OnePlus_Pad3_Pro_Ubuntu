@@ -1,0 +1,435 @@
+diff --git a/lib/process_data/src/gpu_usage.rs b/lib/process_data/src/gpu_usage.rs
+index 2972664..ec17891 100644
+--- a/lib/process_data/src/gpu_usage.rs
++++ b/lib/process_data/src/gpu_usage.rs
+@@ -74,7 +74,7 @@ pub enum GpuUsageStats {
+         dec_percentage: IntegerPercentage,
+         mem_bytes: u64,
+     },
+-    V3dStats {
++    RenderEngineStats {
+         gfx_ns: u64,
+         mem_bytes: u64,
+     },
+@@ -122,9 +122,10 @@ impl GpuUsageStats {
+         match (self, old) {
+             (Self::AmdgpuStats { gfx_ns: a_ns, .. }, Self::AmdgpuStats { gfx_ns: b_ns, .. })
+             | (Self::I915Stats { gfx_ns: a_ns, .. }, Self::I915Stats { gfx_ns: b_ns, .. })
+-            | (Self::V3dStats { gfx_ns: a_ns, .. }, Self::V3dStats { gfx_ns: b_ns, .. }) => {
+-                Self::delta_ns(*a_ns, *b_ns, time_delta)
+-            }
++            | (
++                Self::RenderEngineStats { gfx_ns: a_ns, .. },
++                Self::RenderEngineStats { gfx_ns: b_ns, .. },
++            ) => Self::delta_ns(*a_ns, *b_ns, time_delta),
+             (Self::NvidiaStats { gfx_percentage, .. }, Self::NvidiaStats { .. }) => {
+                 Some(gfx_percentage.fraction())
+             }
+@@ -221,7 +222,7 @@ impl GpuUsageStats {
+         match self {
+             Self::AmdgpuStats { mem_bytes, .. }
+             | Self::NvidiaStats { mem_bytes, .. }
+-            | Self::V3dStats { mem_bytes, .. }
++            | Self::RenderEngineStats { mem_bytes, .. }
+             | Self::XeStats { mem_bytes, .. } => Some(*mem_bytes),
+             Self::I915Stats { .. } => None,
+         }
+@@ -282,15 +283,15 @@ impl GpuUsageStats {
+                 mem_bytes: *a_mem_bytes.max(b_mem_bytes),
+             },
+             (
+-                Self::V3dStats {
++                Self::RenderEngineStats {
+                     gfx_ns: a_gfx_ns,
+                     mem_bytes: a_mem_bytes,
+                 },
+-                Self::V3dStats {
++                Self::RenderEngineStats {
+                     gfx_ns: b_gfx_ns,
+                     mem_bytes: b_mem_bytes,
+                 },
+-            ) => Self::V3dStats {
++            ) => Self::RenderEngineStats {
+                 gfx_ns: *a_gfx_ns.max(b_gfx_ns),
+                 mem_bytes: *a_mem_bytes.max(b_mem_bytes),
+             },
+diff --git a/lib/process_data/src/lib.rs b/lib/process_data/src/lib.rs
+index db9522a..e8bbbe6 100644
+--- a/lib/process_data/src/lib.rs
++++ b/lib/process_data/src/lib.rs
+@@ -74,6 +74,7 @@ static GFX_NS_DRM_FIELDS: Lazy<HashMap<&str, Vec<&str>>> = Lazy::new(|| {
+         ("amdgpu", vec!["drm-engine-compute", "drm-engine-gfx"]),
+         ("i915", vec!["drm-engine-render"]),
+         ("v3d", vec!["drm-engine-render"]),
++        ("msm", vec!["drm-engine-gpu"]),
+     ])
+ });
+ 
+@@ -114,6 +115,7 @@ static MEM_DRM_FIELDS: Lazy<HashMap<&str, Vec<&str>>> = Lazy::new(|| {
+         ("amdxdna_accel_driver", vec!["drm-total-memory"]),
+         ("i915", vec!["drm-total-local0", "drm-total-system0"]),
+         ("v3d", vec!["drm-total-memory"]),
++        ("msm", vec!["drm-total-memory"]),
+         ("xe", vec!["drm-total-gtt", "drm-total-vram0"]),
+     ])
+ });
+@@ -765,7 +767,7 @@ impl ProcessData {
+                         .map(|names| Self::parse_drm_fields(fdinfo, names, &RE_DRM_TIME))
+                         .unwrap_or_default(),
+                 },
+-                "v3d" => GpuUsageStats::V3dStats {
++                "v3d" | "msm" => GpuUsageStats::RenderEngineStats {
+                     gfx_ns: GFX_NS_DRM_FIELDS
+                         .get(driver.as_str())
+                         .map(|names| Self::parse_drm_fields(fdinfo, names, &RE_DRM_TIME))
+diff --git a/po/zh_CN.po b/po/zh_CN.po
+index b272909..e80a707 100644
+--- a/po/zh_CN.po
++++ b/po/zh_CN.po
+@@ -2011,3 +2011,24 @@ msgstr "WWAN 连接"
+ 
+ #~ msgid "Show Search Fields on Launch"
+ #~ msgstr "在启动时显示搜索框"
++
++msgid "Monitored GPU activity"
++msgstr "已监测的 GPU 活动"
++
++msgid "Shared GPU Memory Usage"
++msgstr "GPU 共享内存占用"
++
++msgid "Not applicable (integrated GPU)"
++msgstr "不适用（集成 GPU）"
++
++msgid "Not reported by the GPU driver"
++msgstr "GPU 驱动未报告"
++
++msgid "Shared system memory"
++msgstr "共享系统内存"
++
++msgid "SoC platform bus"
++msgstr "SoC 平台总线"
++
++msgid "KVM unavailable in this boot"
++msgstr "本次启动未启用 KVM"
+diff --git a/src/ui/pages/cpu.rs b/src/ui/pages/cpu.rs
+index 727f040..f4c6721 100644
+--- a/src/ui/pages/cpu.rs
++++ b/src/ui/pages/cpu.rs
+@@ -297,7 +297,17 @@ impl ResCPU {
+         );
+ 
+         imp.virtualization
+-            .set_subtitle(&cpu_info.virtualization.unwrap_or_else(|| i18n("N/A")));
++            .set_subtitle(&cpu_info.virtualization.unwrap_or_else(|| {
++                if cpu_info.architecture.as_deref() == Some("aarch64") {
++                    if std::path::Path::new("/dev/kvm").exists() {
++                        "KVM".to_owned()
++                    } else {
++                        i18n("KVM unavailable in this boot")
++                    }
++                } else {
++                    i18n("N/A")
++                }
++            }));
+ 
+         imp.architecture
+             .set_subtitle(&cpu_info.architecture.unwrap_or_else(|| i18n("N/A")));
+diff --git a/src/ui/pages/gpu.rs b/src/ui/pages/gpu.rs
+index 396ad2a..2d8102f 100644
+--- a/src/ui/pages/gpu.rs
++++ b/src/ui/pages/gpu.rs
+@@ -59,6 +59,8 @@ mod imp {
+         #[template_child]
+         pub link: TemplateChild<adw::ActionRow>,
+ 
++        pub integrated_adreno: Cell<bool>,
++
+         #[property(get)]
+         uses_progress_bar: Cell<bool>,
+ 
+@@ -113,6 +115,7 @@ mod imp {
+                 driver_used: Default::default(),
+                 max_power_cap: Default::default(),
+                 link: Default::default(),
++                integrated_adreno: Cell::new(false),
+                 uses_progress_bar: Cell::new(true),
+                 main_graph_color: glib::Bytes::from_static(&super::ResGPU::MAIN_GRAPH_COLOR),
+                 icon: RefCell::new(ThemedIcon::new("gpu-symbolic").into()),
+@@ -210,7 +213,13 @@ impl ResGPU {
+         let tab_id = format!("{}-{}", TAB_ID_PREFIX, &gpu.gpu_identifier());
+         imp.set_tab_id(&tab_id);
+ 
+-        imp.gpu_usage.set_title_label(&i18n("Total Usage"));
++        let adreno = gpu.is_opd2513_adreno();
++        imp.integrated_adreno.set(adreno);
++        imp.gpu_usage.set_title_label(&if adreno {
++            i18n("Monitored GPU activity")
++        } else {
++            i18n("Total Usage")
++        });
+         imp.gpu_usage.graph().set_graph_color(
+             Self::MAIN_GRAPH_COLOR[0],
+             Self::MAIN_GRAPH_COLOR[1],
+@@ -234,23 +243,33 @@ impl ResGPU {
+             .end_graph()
+             .set_graph_color(0xe0, 0x1b, 0x24);
+ 
+-        imp.vram_usage.set_title_label(&i18n("Video Memory Usage"));
++        imp.vram_usage.set_title_label(&if adreno {
++            i18n("Shared GPU Memory Usage")
++        } else {
++            i18n("Video Memory Usage")
++        });
+         imp.vram_usage.graph().set_graph_color(0xc0, 0x1c, 0x28);
+ 
+         imp.temperature.set_title_label(&i18n("Temperature"));
+         imp.temperature.graph().set_graph_color(0xa5, 0x1d, 0x2d);
+         imp.temperature.graph().set_locked_max_y(None);
+ 
+-        imp.manufacturer.set_subtitle(
+-            &gpu.get_vendor()
+-                .map_or_else(|_| i18n("N/A"), |vendor| vendor.name().to_string()),
+-        );
++        imp.manufacturer.set_subtitle(&if adreno {
++            "Qualcomm".to_owned()
++        } else {
++            gpu.get_vendor()
++                .map_or_else(|_| i18n("N/A"), |vendor| vendor.name().to_string())
++        });
+ 
+         match gpu.gpu_identifier() {
+             GpuIdentifier::PciSlot(pci_slot) => {
+                 imp.pci_slot.set_subtitle(&pci_slot.to_string());
+             }
+-            GpuIdentifier::Enumerator(_) => imp.pci_slot.set_subtitle(&i18n("N/A")),
++            GpuIdentifier::Enumerator(_) => imp.pci_slot.set_subtitle(&if adreno {
++                i18n("Not applicable (integrated GPU)")
++            } else {
++                i18n("N/A")
++            }),
+         }
+ 
+         imp.driver_used.set_subtitle(gpu.driver());
+@@ -382,7 +401,13 @@ impl ResGPU {
+             None
+         };
+ 
+-        let mut power_string = power_usage.map_or_else(|| i18n("N/A"), convert_power);
++        let integrated_adreno = imp.integrated_adreno.get();
++        let missing_power = if integrated_adreno {
++            i18n("Not reported by the GPU driver")
++        } else {
++            i18n("N/A")
++        };
++        let mut power_string = power_usage.map_or_else(|| missing_power.clone(), convert_power);
+ 
+         if let Some(power_cap) = power_cap {
+             let _ = write!(power_string, " / {}", convert_power(*power_cap));
+@@ -400,12 +425,15 @@ impl ResGPU {
+         if let Some(vram_clockspeed) = vram_speed {
+             imp.vram_clockspeed
+                 .set_subtitle(&convert_frequency(*vram_clockspeed));
++        } else if integrated_adreno {
++            imp.vram_clockspeed
++                .set_subtitle(&i18n("Shared system memory"));
+         } else {
+             imp.vram_clockspeed.set_subtitle(&i18n("N/A"));
+         }
+ 
+         imp.max_power_cap
+-            .set_subtitle(&power_cap_max.map_or_else(|| i18n("N/A"), convert_power));
++            .set_subtitle(&power_cap_max.map_or(missing_power, convert_power));
+ 
+         self.set_property("usage", usage_fraction.unwrap_or(0.0));
+ 
+@@ -440,6 +468,8 @@ impl ResGPU {
+ 
+         if let Some(link) = link {
+             imp.link.set_subtitle(&link.to_string());
++        } else if integrated_adreno {
++            imp.link.set_subtitle(&i18n("SoC platform bus"));
+         } else {
+             imp.link.set_subtitle(&i18n("N/A"));
+         }
+diff --git a/src/utils/cpu.rs b/src/utils/cpu.rs
+index 9c4bb4d..7a61177 100644
+--- a/src/utils/cpu.rs
++++ b/src/utils/cpu.rs
+@@ -3,7 +3,7 @@ use glob::glob;
+ use lazy_regex::{Lazy, Regex, lazy_regex};
+ use log::{debug, trace, warn};
+ use std::{
+-    collections::HashMap,
++    collections::{HashMap, HashSet},
+     path::{Path, PathBuf},
+     sync::LazyLock,
+ };
+@@ -43,6 +43,49 @@ static CPU_TEMPERATURE_PATH: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+         })
+ });
+ 
++static QUALCOMM_CPU_TEMPERATURE_PATHS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
++    if !std::fs::read("/sys/firmware/devicetree/base/compatible").is_ok_and(|data| {
++        data.split(|byte| *byte == 0)
++            .any(|name| name == b"oneplus,opd2513")
++    }) {
++        return Vec::new();
++    }
++    glob("/sys/class/thermal/thermal_zone*/type")
++        .unwrap()
++        .flatten()
++        .filter(|path| {
++            read_parsed::<String>(path).is_ok_and(|kind| {
++                kind.strip_prefix("cpu-")
++                    .is_some_and(|suffix| suffix.starts_with(|c: char| c.is_ascii_digit()))
++            })
++        })
++        .map(|path| path.with_file_name("temp"))
++        .collect()
++});
++
++fn topology_groups(field: &str, expected_cpus: usize) -> Option<usize> {
++    let paths = glob(&format!(
++        "/sys/devices/system/cpu/cpu[0-9]*/topology/{field}"
++    ))
++    .ok()?
++    .collect::<Result<Vec<_>, _>>()
++    .ok()?;
++    if paths.is_empty() || paths.len() != expected_cpus {
++        return None;
++    }
++    paths
++        .into_iter()
++        .try_fold(HashSet::new(), |mut groups, path| {
++            let value = read_parsed::<String>(path).ok()?;
++            if value.is_empty() || value.starts_with('-') {
++                return None;
++            }
++            groups.insert(value);
++            Some(groups)
++        })
++        .map(|groups| groups.len())
++}
++
+ fn search_for_first_temp<S: AsRef<str>>(base_path: S) -> Option<PathBuf> {
+     glob(&format!("{}/temp*_input", base_path.as_ref()))
+         .unwrap()
+@@ -232,7 +275,18 @@ impl CpuInfo {
+                 .stdout,
+         )
+         .context("unable to parse lscpu output to UTF-8")
+-        .map(Self::parse_lscpu)
++        .map(|output| {
++            let mut cpu = Self::parse_lscpu(&output);
++            if let Some(logical) = cpu.logical_cpus {
++                cpu.physical_cpus = cpu
++                    .physical_cpus
++                    .or_else(|| topology_groups("core_cpus_list", logical));
++                cpu.sockets = cpu
++                    .sockets
++                    .or_else(|| topology_groups("physical_package_id", logical));
++            }
++            cpu
++        })
+     }
+ }
+ 
+@@ -320,6 +374,13 @@ pub fn get_cpu_usage() -> Vec<Result<(u64, u64)>> {
+ ///
+ /// Will return `Err` if there was no way to read the CPU temperature.
+ pub fn get_temperature() -> Result<f32> {
++    if let Some(hottest) = QUALCOMM_CPU_TEMPERATURE_PATHS
++        .iter()
++        .filter_map(|path| read_sysfs_thermal(path).ok())
++        .max_by(f32::total_cmp)
++    {
++        return Ok(hottest);
++    }
+     if let Some(path) = CPU_TEMPERATURE_PATH.as_ref() {
+         read_sysfs_thermal(path)
+     } else {
+diff --git a/src/utils/gpu/mod.rs b/src/utils/gpu/mod.rs
+index 521fed6..ab3d098 100644
+--- a/src/utils/gpu/mod.rs
++++ b/src/utils/gpu/mod.rs
+@@ -362,6 +362,10 @@ impl Gpu {
+         Ok(gpu)
+     }
+ 
++    pub fn is_opd2513_adreno(&self) -> bool {
++        matches!(self, Self::Other(gpu) if gpu.is_opd2513_adreno())
++    }
++
+     pub fn get_vendor(&self) -> Result<&'static Vendor> {
+         Ok(self.device().context("no device")?.vendor())
+     }
+diff --git a/src/utils/gpu/other.rs b/src/utils/gpu/other.rs
+index 8a80da9..437c5c6 100644
+--- a/src/utils/gpu/other.rs
++++ b/src/utils/gpu/other.rs
+@@ -3,7 +3,7 @@ use process_data::gpu_usage::GpuIdentifier;
+ 
+ use std::path::{Path, PathBuf};
+ 
+-use crate::utils::pci::Device;
++use crate::utils::{pci::Device, read_parsed};
+ 
+ use super::GpuImpl;
+ 
+@@ -35,6 +35,16 @@ impl OtherGpu {
+     }
+ }
+ 
++impl OtherGpu {
++    pub(super) fn is_opd2513_adreno(&self) -> bool {
++        self.driver == "msm_dpu"
++            && std::fs::read("/sys/firmware/devicetree/base/compatible").is_ok_and(|data| {
++                data.split(|byte| *byte == 0)
++                    .any(|name| name == b"oneplus,opd2513")
++            })
++    }
++}
++
+ impl GpuImpl for OtherGpu {
+     fn device(&self) -> Option<&'static Device> {
+         self.device
+@@ -57,6 +67,9 @@ impl GpuImpl for OtherGpu {
+     }
+ 
+     fn name(&self) -> Result<String> {
++        if self.is_opd2513_adreno() {
++            return Ok("Adreno 840".to_owned());
++        }
+         self.drm_name()
+     }
+ 
+@@ -85,6 +98,19 @@ impl GpuImpl for OtherGpu {
+     }
+ 
+     fn temperature(&self) -> Result<f64> {
++        if self.is_opd2513_adreno() {
++            let zones = glob::glob("/sys/class/thermal/thermal_zone*/type")?;
++            return zones
++                .flatten()
++                .filter(|path| {
++                    std::fs::read_to_string(path)
++                        .is_ok_and(|kind| kind.trim().starts_with("gpuss-"))
++                })
++                .filter_map(|path| read_parsed::<i64>(path.with_file_name("temp")).ok())
++                .max()
++                .map(|millidegrees| millidegrees as f64 / 1000.0)
++                .ok_or_else(|| anyhow::anyhow!("No readable Adreno thermal sensors"));
++        }
+         self.hwmon_temperature()
+     }
+ 
+@@ -93,6 +119,9 @@ impl GpuImpl for OtherGpu {
+     }
+ 
+     fn core_frequency(&self) -> Result<f64> {
++        if self.is_opd2513_adreno() {
++            return read_parsed("/sys/class/devfreq/3d00000.gpu/cur_freq");
++        }
+         self.hwmon_core_frequency()
+     }
+ 

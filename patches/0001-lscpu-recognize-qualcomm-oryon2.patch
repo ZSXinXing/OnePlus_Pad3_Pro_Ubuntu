@@ -1,0 +1,45 @@
+--- a/sys-utils/lscpu-arm.c
++++ b/sys-utils/lscpu-arm.c
+@@ -150,6 +150,7 @@
+ 
+ static const struct id_part qcom_part[] = {
+     { 0x001, "Oryon" },
++    { 0x002, "Oryon-2" },
+     { 0x00f, "Scorpion" },
+     { 0x02d, "Scorpion" },
+     { 0x04d, "Krait" },
+@@ -462,12 +463,34 @@
+ 	return 0;
+ }
+ 
++/* Qualcomm's SMEM SoC ID distinguishes the mobile platform from its
++ * shared CPU MIDR. Only identify a known, live SoC; offline snapshots and
++ * unrecognized devices retain the normal core-name decoding above.
++ */
++static void qcom_soc_decode(struct lscpu_cxt *cxt, struct lscpu_cputype *ct)
++{
++	FILE *file;
++	unsigned int id;
++
++	if (!is_live(cxt) || parse_implementer_id(ct) != 0x51)
++		return;
++	file = fopen("/sys/devices/soc0/soc_id", "re");
++	if (!file)
++		return;
++	if (fscanf(file, "%u", &id) == 1 && id == 661) {
++		free(ct->modelname);
++		ct->modelname = xstrdup("Qualcomm Snapdragon 8 Elite Gen 5 (SM8850P)");
++	}
++	fclose(file);
++}
++
+ static void arm_decode(struct lscpu_cxt *cxt, struct lscpu_cputype *ct)
+ {
+ 	if (is_live(cxt) && access(_PATH_SYS_DMI, R_OK) == 0)
+ 		dmi_decode_cputype(ct);
+ 
+ 	arm_ids_decode(ct);
++	qcom_soc_decode(cxt, ct);
+ 	arm_rXpY_decode(ct);
+ 
+ 	if (is_live(cxt) && cxt->is_cluster)
