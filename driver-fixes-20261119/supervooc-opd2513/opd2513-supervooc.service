@@ -1,0 +1,16 @@
+[Unit]
+Description=OPD2513 verified SuperVOOC profile
+After=systemd-modules-load.service local-fs.target
+ConditionPathExists=/sys/firmware/devicetree/base/compatible
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/opd2513-supervooc/opd2513-supervooc-load.py
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=15s
+TimeoutStartSec=30s
+
+[Install]
+WantedBy=multi-user.target

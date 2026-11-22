@@ -1,0 +1,82 @@
+diff --git a/arch/arm64/boot/dts/qcom/kaanapali-oneplus-iceland.dts b/arch/arm64/boot/dts/qcom/kaanapali-oneplus-iceland.dts
+--- a/arch/arm64/boot/dts/qcom/kaanapali-oneplus-iceland.dts
++++ b/arch/arm64/boot/dts/qcom/kaanapali-oneplus-iceland.dts
+@@ -994,6 +994,12 @@
+ 	};
+ };
+ 
++/* Secondary SC8547D charge pump. */
++&i2c12 {
++	clock-frequency = <400000>;
++	status = "okay";
++};
++
+ &i2c14 {
+ 	status = "okay";
+ 
+@@ -1014,6 +1020,50 @@
+ 		reg = <0x11>;
+ 		vin-supply = <&vph_pwr>;
+ 		enable-gpios = <&tlmm 1 GPIO_ACTIVE_HIGH>;
++	};
++};
++
++&i2c_master_hub {
++	status = "okay";
++};
++
++/* Primary SC8547D charge pump with the AP VOOC PHY. */
++&i2c_hub_0 {
++	clock-frequency = <400000>;
++	status = "okay";
++
++	charger@6a {
++		compatible = "southchip,sc8547d";
++		reg = <0x6a>;
++		interrupts-extended = <&tlmm 0 IRQ_TYPE_EDGE_FALLING>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&vooc_irq_default>;
++		io-channels = <&pmk8850_vadc 0x2747>, <&pmk8850_vadc 0x2744>,
++			      <&pmk8850_vadc 0x274b>;
++		io-channel-names = "usb-connector", "battery-connector", "vooc-mos";
++	};
++};
++
++&pmk8850_vadc {
++	channel@2744 {
++		reg = <0x2744>;
++		label = "batt_con_therm_adc";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++
++	channel@2747 {
++		reg = <0x2747>;
++		label = "usb_con_therm_adc";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++
++	channel@274b {
++		reg = <0x274b>;
++		label = "svooc_mos_btb_therm";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
+ 	};
+ };
+ 
+@@ -1314,6 +1364,14 @@
+ &tlmm {
+ 	gpio-reserved-ranges = <36 4>;
+ 
++	vooc_irq_default: vooc-irq-state {
++		pins = "gpio0";
++		function = "gpio";
++		input-enable;
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
+ 	wlan_en: wlan-en-state {
+ 		pins = "gpio16";
+ 		function = "gpio";

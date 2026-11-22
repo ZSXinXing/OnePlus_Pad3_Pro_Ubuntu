@@ -4,7 +4,7 @@
 
 An Ubuntu 26.04.1 LTS arm64 port for **OnePlus Pad 3 Pro (OPD2513, SM8850P)**. Native GNOME and an Ubuntu root filesystem on internal UFS have been tested on the development tablet using a temporary RAM boot. Images for other OnePlus tablets are not interchangeable, even if the devices share the same SoC.
 
-This is a development source release, not a production installer. Standalone cold boot and charging remain blockers for a supported permanent installation. Keep stock Recovery and its boot dependencies intact; charging in stock Recovery was tested on the development tablet.
+This is a development source release. The November 23, 2026 SuperVOOC fix passed a short on-device charging run and the user confirmed normal charging. Standalone cold boot and full-cycle charging still need validation. Keep stock Recovery and its boot dependencies intact; charging in stock Recovery was tested on the development tablet.
 
 ## Hardware status
 
@@ -18,9 +18,15 @@ This is a development source release, not a production installer. Standalone col
 | Internal audio | Microphone recording and speaker playback work. A test signal was detected for each of six amplifier paths; all eight physical speakers have not been verified individually. |
 | Front and rear cameras | Integrated with the system camera app; rear frames were captured. Autofocus is implemented, but final sharpness and front-camera image quality need on-device checks. |
 | Flashlight | The system-wide GNOME toggle is installed immediately left of Screenshot. Driver readback at the updated brightness passed; physical light output is not yet confirmed. |
-| Charging | Battery telemetry and some USB/charger negotiation are visible. Reliable net charging via ordinary USB, PD or the original fast charger is not established under Ubuntu. |
+| Charging | Original SuperVOOC charger: approximately 100 s, 58.29 W peak / 55.62 W mean at the pumps, +263.301 mAh net battery charge, with a sustained 6.1 A request. User confirmed normal charging. Ordinary USB, standard PD, full-cycle charging and cold boot remain unverified. |
 
 These are development-device results. The baseline rootfs build does not automatically include every experimental change. See the [patch inventory](patches/README.md) for scope and baselines.
+
+## Charging fix — November 23, 2026
+
+The previous policy incorrectly applied a 44°C battery boundary to connector temperature, causing a 6.1 A to 3 A drop after about 14 seconds. The fix uses the existing 55°C connector exit threshold and retains battery temperature, voltage, SOC, overcurrent and pump-fault protections. The charger’s 67 W rating is not a constant-power guarantee. Reported power is pump VBUS times the sum of pump IBUS, rather than adapter input or net battery power.
+
+See the [English charging guide](driver-fixes-20261119/supervooc-opd2513/README.en.md) for persistent rootfs installation, RAM-image packing, hashes, rollback and validation limits, and the [measurement record](driver-fixes-20261119/supervooc-opd2513/validation-20261123.json). Persistence tooling and a RAM image were prepared on the host; neither tablet installation nor restart validation was performed in this publication task. Use `fastboot boot` and preserve stock Recovery. Standalone cold boot remains unverified.
 
 ## Build and install
 

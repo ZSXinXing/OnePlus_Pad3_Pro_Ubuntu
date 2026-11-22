@@ -1,0 +1,793 @@
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 393cf91db..84773934d 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -5,8 +5,10 @@
+  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ #include <linux/auxiliary_bus.h>
++#include <linux/delay.h>
+ #include <linux/devm-helpers.h>
+ #include <linux/module.h>
++#include <linux/i2c.h>
+ #include <linux/mutex.h>
+ #include <linux/nvmem-consumer.h>
+ #include <linux/of_device.h>
+@@ -16,6 +18,7 @@
+ #include <linux/soc/qcom/pmic_glink.h>
+ #include <linux/math.h>
+ #include <linux/units.h>
++#include <linux/usb/wcd939x-usbss.h>
+ 
+ #define BATTMGR_CHEMISTRY_LEN	4
+ #define BATTMGR_STRING_LEN	128
+@@ -119,10 +122,17 @@ enum qcom_battmgr_variant {
+ 
+ #define BATTMGR_OPLUS_PROPERTY_SET			0x300
+ #define BATTMGR_OPLUS_PROPERTY_GET			0x301
++#define OPLUS_USB_INPUT_CURRENT_LIMIT			5
++#define OPLUS_USB_TYPE					7
++#define OPLUS_USB_TYPE_BRICK_ID				9
+ #define OPLUS_USB_OTG_AP_ENABLE				12
+ #define OPLUS_USB_OTG_VBUS_REGULATOR_ENABLE		19
+ #define OPLUS_USB_OTG_BOOST_CURRENT			59
++#define OPLUS_CAPACITY					68
++#define OPLUS_CHARGER_COUNTER				69
+ #define OPLUS_CHG_EN					70
++#define OPLUS_BATTERY_AUTH				76
++#define OPLUS_SET_PD_ENABLE				123
+ 
+ struct qcom_battmgr_enable_request {
+ 	struct pmic_glink_hdr hdr;
+@@ -329,6 +339,9 @@ struct qcom_battmgr_wireless {
+ 
+ struct qcom_battmgr_oplus {
+ 	bool otg_state;
++	bool vooc_buck_held;
++	u32 vooc_saved_icl;
++	u32 value;
+ };
+ 
+ struct qcom_battmgr {
+@@ -348,6 +361,7 @@ struct qcom_battmgr {
+ 	struct completion ack;
+ 
+ 	bool service_up;
++	bool removing;
+ 
+ 	struct qcom_battmgr_info info;
+ 	struct qcom_battmgr_status status;
+@@ -358,7 +372,9 @@ struct qcom_battmgr {
+ 
+ 	struct work_struct enable_work;
+ 	struct work_struct oplus_otg_work;
+-	struct work_struct oplus_charging_work;
++	struct work_struct oplus_dpdm_claim_work;
++	struct delayed_work oplus_dpdm_release_work;
++	bool oplus_dpdm_claimed;
+ 
+ 	/*
+ 	 * @lock is used to prevent concurrent power supply requests to the
+@@ -372,6 +388,10 @@ static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t
+ 	unsigned long left;
+ 	int ret;
+ 
++	lockdep_assert_held(&battmgr->lock);
++	if (battmgr->removing)
++		return -ENODEV;
++
+ 	reinit_completion(&battmgr->ack);
+ 
+ 	battmgr->error = 0;
+@@ -496,6 +516,68 @@ static int qcom_battmgr_bat_sm8350_update(struct qcom_battmgr *battmgr,
+ 	return ret;
+ }
+ 
++static int qcom_battmgr_oplus_bat_status(struct qcom_battmgr *battmgr,
++					union power_supply_propval *val)
++{
++	int ret, status;
++
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
++					   BATT_STATUS, 0);
++	if (ret)
++		goto unlock;
++
++	status = battmgr->status.status;
++	if (status == POWER_SUPPLY_STATUS_CHARGING || battmgr->oplus.vooc_buck_held) {
++		/* During AP VOOC, SoCCP reports the disabled buck, not battery flow. */
++		ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
++						   BATT_CURR_NOW, 0);
++		if (ret)
++			goto unlock;
++		if (battmgr->status.current_now < 0)
++			status = POWER_SUPPLY_STATUS_DISCHARGING;
++		else if (battmgr->oplus.vooc_buck_held)
++			status = battmgr->status.current_now > 0 ?
++				POWER_SUPPLY_STATUS_CHARGING : POWER_SUPPLY_STATUS_NOT_CHARGING;
++	}
++	val->intval = status;
++
++unlock:
++	mutex_unlock(&battmgr->lock);
++	return ret;
++}
++
++/* SoCCP gauge properties used by the OPD2513 stock fg_sm8350_get_* path. */
++static int qcom_battmgr_oplus_gauge_get(struct qcom_battmgr *battmgr,
++				      enum power_supply_property psp,
++				      union power_supply_propval *val)
++{
++	u32 prop, raw;
++	int ret;
++
++	prop = psp == POWER_SUPPLY_PROP_CAPACITY ? OPLUS_CAPACITY : OPLUS_CHARGER_COUNTER;
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_GET, prop, 0);
++	if (ret)
++		goto out;
++	raw = battmgr->oplus.value;
++	if ((psp == POWER_SUPPLY_PROP_CAPACITY && raw > 10000) || (s32)raw < 0) {
++		ret = -ERANGE;
++		goto out;
++	}
++	/* Stock reports centi-percent and microamp-hours, respectively. */
++	if (psp == POWER_SUPPLY_PROP_CAPACITY) {
++		battmgr->status.percent = DIV_ROUND_CLOSEST(raw, 100);
++		val->intval = battmgr->status.percent;
++	} else {
++		battmgr->info.charge_count = raw;
++		val->intval = raw;
++	}
++out:
++	mutex_unlock(&battmgr->lock);
++	return ret;
++}
++
+ static int qcom_battmgr_bat_sc8280xp_update(struct qcom_battmgr *battmgr,
+ 					    enum power_supply_property psp)
+ {
+@@ -546,6 +628,13 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
+ 
++	if (battmgr->variant == OPLUS_BATTMGR_KAANAPALI &&
++	    psp == POWER_SUPPLY_PROP_STATUS)
++		return qcom_battmgr_oplus_bat_status(battmgr, val);
++	if (battmgr->variant == OPLUS_BATTMGR_KAANAPALI &&
++	    (psp == POWER_SUPPLY_PROP_CAPACITY || psp == POWER_SUPPLY_PROP_CHARGE_COUNTER))
++		return qcom_battmgr_oplus_gauge_get(battmgr, psp, val);
++
+ 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
+ 	    battmgr->variant == QCOM_BATTMGR_X1E80100)
+ 		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
+@@ -699,6 +788,8 @@ static int qcom_battmgr_set_charge_control(struct qcom_battmgr *battmgr,
+ 		.delta_soc = cpu_to_le32(delta_soc),
+ 	};
+ 
++	if (battmgr->oplus.vooc_buck_held)
++		return -EBUSY;
+ 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+ }
+ 
+@@ -726,13 +817,13 @@ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr,
+ 
+ 	mutex_lock(&battmgr->lock);
+ 	ret = qcom_battmgr_set_charge_control(battmgr, target_soc, delta_soc);
+-	mutex_unlock(&battmgr->lock);
+ 	if (!ret) {
+ 		battmgr->info.charge_ctrl_start = start_soc;
+ 		battmgr->info.charge_ctrl_end = target_soc;
+ 	}
+ 
+-	return 0;
++	mutex_unlock(&battmgr->lock);
++	return ret;
+ }
+ 
+ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, int end_soc)
+@@ -747,13 +838,13 @@ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, i
+ 
+ 	mutex_lock(&battmgr->lock);
+ 	ret = qcom_battmgr_set_charge_control(battmgr, end_soc, delta_soc);
+-	mutex_unlock(&battmgr->lock);
+ 	if (!ret) {
+ 		battmgr->info.charge_ctrl_start = end_soc - delta_soc;
+ 		battmgr->info.charge_ctrl_end = end_soc;
+ 	}
+ 
+-	return 0;
++	mutex_unlock(&battmgr->lock);
++	return ret;
+ }
+ 
+ static int qcom_battmgr_charge_control_thresholds_init(struct qcom_battmgr *battmgr)
+@@ -785,6 +876,198 @@ static int qcom_battmgr_charge_control_thresholds_init(struct qcom_battmgr *batt
+ 	return 0;
+ }
+ 
++int qcom_battmgr_oplus_battery_authentic(struct power_supply *psy);
++
++int qcom_battmgr_oplus_battery_authentic(struct power_supply *psy)
++{
++	struct qcom_battmgr *battmgr;
++	int ret;
++
++	if (psy->desc->get_property != qcom_battmgr_bat_get_property)
++		return -EINVAL;
++	battmgr = power_supply_get_drvdata(psy);
++	if (battmgr->variant != OPLUS_BATTMGR_KAANAPALI)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_GET,
++					   OPLUS_BATTERY_AUTH, 0);
++	if (!ret)
++		ret = battmgr->oplus.value <= 1 ? battmgr->oplus.value : -EPROTO;
++	mutex_unlock(&battmgr->lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(qcom_battmgr_oplus_battery_authentic);
++
++static int qcom_battmgr_oplus_read(struct qcom_battmgr *battmgr, u32 prop, u32 *value)
++{
++	int ret;
++
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_GET, prop, 0);
++	if (!ret)
++		*value = battmgr->oplus.value;
++	return ret;
++}
++
++static int qcom_battmgr_oplus_buck_read(struct qcom_battmgr *battmgr, u32 prop, u32 *value)
++{
++	int ret;
++
++	if (prop != OPLUS_USB_INPUT_CURRENT_LIMIT)
++		return qcom_battmgr_oplus_read(battmgr, prop, value);
++
++	/* OPD2513 SoCCP accepts the Oplus ICL SET but lacks the vendor GET. */
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET,
++					   USB_INPUT_CURR_LIMIT, 0);
++	if (!ret)
++		*value = battmgr->usb.current_limit;
++	return ret;
++}
++
++static int qcom_battmgr_oplus_write_checked(struct qcom_battmgr *battmgr, u32 prop, u32 value)
++{
++	u32 actual;
++	int ret, attempt;
++
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET, prop, value);
++	if (ret) {
++		dev_warn(battmgr->dev, "SuperVOOC buck SET %u=%u failed: %d\n", prop, value, ret);
++		return ret;
++	}
++	/* The remote vote can be applied after the SET acknowledgement. */
++	for (attempt = 0; attempt < 6; attempt++) {
++		if (attempt)
++			msleep(20);
++		ret = qcom_battmgr_oplus_buck_read(battmgr, prop, &actual);
++		if (ret) {
++			dev_warn(battmgr->dev, "SuperVOOC buck GET %u failed: %d\n", prop, ret);
++			return ret;
++		}
++		if (actual == value)
++			return 0;
++	}
++	dev_warn(battmgr->dev, "SuperVOOC buck property %u requested %u, read %u\n",
++		 prop, value, actual);
++	return -EIO;
++}
++
++static int qcom_battmgr_oplus_buck_input_ua(struct qcom_battmgr *battmgr, u32 *ua)
++{
++	int ret;
++
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET,
++					   USB_CURR_NOW, 0);
++	if (!ret)
++		*ua = battmgr->usb.current_now;
++	return ret;
++}
++
++static int qcom_battmgr_oplus_vooc_input_off(struct qcom_battmgr *battmgr)
++{
++	u32 ua = U32_MAX;
++	int ret, i, low = 0;
++
++	/* The ICL GET reports the stored vote. Verify physical input current. */
++	for (i = 0; i < 30; i++) {
++		msleep(50);
++		ret = qcom_battmgr_oplus_buck_input_ua(battmgr, &ua);
++		if (ret)
++			return ret;
++		if (ua > 50000)
++			low = 0;
++		else if (++low == 3) {
++			dev_info(battmgr->dev, "SuperVOOC buck off, USB input %u uA\n", ua);
++			return 0;
++		}
++	}
++	dev_warn(battmgr->dev, "SuperVOOC buck still drawing %u uA\n", ua);
++	return -EIO;
++}
++
++static int qcom_battmgr_oplus_vooc_release(struct qcom_battmgr *battmgr)
++{
++	int ret, unsuspend, restore;
++
++	if (!battmgr->oplus.vooc_buck_held)
++		return 0;
++
++	ret = qcom_battmgr_oplus_write_checked(battmgr, OPLUS_CHG_EN, 1);
++	unsuspend = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
++						 OPLUS_USB_INPUT_CURRENT_LIMIT, U32_MAX);
++	restore = qcom_battmgr_oplus_write_checked(battmgr, OPLUS_USB_INPUT_CURRENT_LIMIT,
++						  battmgr->oplus.vooc_saved_icl);
++	if (!ret && !unsuspend && !restore)
++		battmgr->oplus.vooc_buck_held = false;
++
++	return ret ?: unsuspend ?: restore;
++}
++
++int qcom_battmgr_oplus_vooc_hold(struct power_supply *psy, bool hold);
++
++int qcom_battmgr_oplus_vooc_hold(struct power_supply *psy, bool hold)
++{
++	struct qcom_battmgr *battmgr;
++	u32 icl, enabled, input_ua;
++	int ret;
++
++	if (psy->desc->get_property != qcom_battmgr_bat_get_property)
++		return -EINVAL;
++	battmgr = power_supply_get_drvdata(psy);
++	if (battmgr->variant != OPLUS_BATTMGR_KAANAPALI)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&battmgr->lock);
++	if (!hold) {
++		ret = qcom_battmgr_oplus_vooc_release(battmgr);
++		goto out;
++	}
++	if (battmgr->oplus.vooc_buck_held || battmgr->info.charge_ctrl_end) {
++		ret = -EBUSY;
++		goto out;
++	}
++	if (!READ_ONCE(battmgr->service_up)) {
++		ret = -ENOTCONN;
++		goto out;
++	}
++	ret = qcom_battmgr_oplus_buck_read(battmgr, OPLUS_USB_INPUT_CURRENT_LIMIT, &icl);
++	if (ret)
++		goto out;
++	ret = qcom_battmgr_oplus_read(battmgr, OPLUS_CHG_EN, &enabled);
++	if (ret)
++		goto out;
++	if (!icl || icl > 5000000 || enabled != 1) {
++		ret = -EBUSY;
++		goto out;
++	}
++
++	ret = qcom_battmgr_oplus_buck_input_ua(battmgr, &input_ua);
++	if (ret)
++		goto out;
++	if (input_ua < 150000 || input_ua > icl + 50000) {
++		ret = -EAGAIN;
++		goto out;
++	}
++
++	/* A timed-out SET may have taken effect. Keep the snapshot for unwind. */
++	battmgr->oplus.vooc_saved_icl = icl;
++	battmgr->oplus.vooc_buck_held = true;
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
++					   OPLUS_USB_INPUT_CURRENT_LIMIT, 0);
++	if (!ret)
++		ret = qcom_battmgr_oplus_vooc_input_off(battmgr);
++	if (!ret)
++		ret = qcom_battmgr_oplus_write_checked(battmgr, OPLUS_CHG_EN, 0);
++	if (ret && qcom_battmgr_oplus_vooc_release(battmgr))
++		dev_err(battmgr->dev, "could not restore charging votes after VOOC handoff\n");
++out:
++	mutex_unlock(&battmgr->lock);
++	if (!ret)
++		power_supply_changed(psy);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(qcom_battmgr_oplus_vooc_hold);
++
+ static int qcom_battmgr_bat_is_writeable(struct power_supply *psy,
+ 					 enum power_supply_property psp)
+ {
+@@ -1024,6 +1307,38 @@ static int qcom_battmgr_usb_sm8350_update(struct qcom_battmgr *battmgr,
+ 	return ret;
+ }
+ 
++static int qcom_battmgr_oplus_usb_type(struct qcom_battmgr *battmgr,
++				      union power_supply_propval *val)
++{
++	int ret;
++	u32 type;
++
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_GET,
++					   OPLUS_USB_TYPE, 0);
++	if (!ret) {
++		type = battmgr->oplus.value;
++		/* The vendor ABI predates the addition of the SPR AVS types. */
++		if (type <= POWER_SUPPLY_USB_TYPE_PD_PPS) {
++			val->intval = type;
++			goto unlock;
++		}
++		if (type == OPLUS_USB_TYPE_BRICK_ID) {
++			val->intval = POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID;
++			goto unlock;
++		}
++	}
++
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET,
++					   USB_TYPE, 0);
++	if (!ret)
++		val->intval = battmgr->usb.usb_type;
++
++unlock:
++	mutex_unlock(&battmgr->lock);
++	return ret;
++}
++
+ static int qcom_battmgr_usb_get_property(struct power_supply *psy,
+ 					 enum power_supply_property psp,
+ 					 union power_supply_propval *val)
+@@ -1034,6 +1349,10 @@ static int qcom_battmgr_usb_get_property(struct power_supply *psy,
+ 	if (!battmgr->service_up)
+ 		return -EAGAIN;
+ 
++	if (battmgr->variant == OPLUS_BATTMGR_KAANAPALI &&
++	    psp == POWER_SUPPLY_PROP_USB_TYPE)
++		return qcom_battmgr_oplus_usb_type(battmgr, val);
++
+ 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
+ 	    battmgr->variant == QCOM_BATTMGR_X1E80100)
+ 		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
+@@ -1232,6 +1551,8 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
+ 	notification &= 0xff;
+ 
+ 	if (battmgr->variant == OPLUS_BATTMGR_KAANAPALI) {
++		dev_dbg(battmgr->dev, "Oplus charging notification: %#x\n",
++			le32_to_cpu(msg->notification));
+ 		switch (notification) {
+ 		case NOTIF_OPLUS_OTG_ENABLE:
+ 			battmgr->oplus.otg_state = true;
+@@ -1244,13 +1565,19 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
+ 		case NOTIF_OPLUS_CID_DETECT:
+ 			return;
+ 		case NOTIF_OPLUS_TYPEC_STATE_CHANGE:
+-			return;
+ 		case NOTIF_OPLUS_PLUGIN_IRQ:
+-			schedule_work(&battmgr->oplus_charging_work);
++			/* Input votes, including a zero/suspend vote, survive attach. */
++			power_supply_changed(battmgr->usb_psy);
++			power_supply_changed(battmgr->bat_psy);
+ 			return;
+ 		case NOTIF_OPLUS_APSD_DONE:
+-		case NOTIF_OPLUS_UFCS_DISABLE_MOS:
++			schedule_work(&battmgr->oplus_dpdm_claim_work);
++			fallthrough;
+ 		case NOTIF_OPLUS_PD_SOURCECAP_DONE:
++			power_supply_changed(battmgr->usb_psy);
++			power_supply_changed(battmgr->bat_psy);
++			return;
++		case NOTIF_OPLUS_UFCS_DISABLE_MOS:
+ 		case NOTIF_OPLUS_POWER_ROLE_STATUS:
+ 			return;
+ 		}
+@@ -1437,23 +1764,26 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 		switch (opcode) {
+ 		case BATTMGR_OPLUS_PROPERTY_SET:
+ 		case BATTMGR_OPLUS_PROPERTY_GET:
+-			property = le32_to_cpu(resp->intval.property);
+ 			if (payload_len != sizeof(resp->intval)) {
+ 				dev_warn(battmgr->dev,
+ 					"invalid payload length for %#x request: %zd\n",
+-					property, payload_len);
++					opcode, payload_len);
+ 				battmgr->error = -ENODATA;
+-				return;
++				goto out_complete;
+ 			}
+ 
+-			battmgr->error = le32_to_cpu(resp->intval.result);
+-			if (battmgr->error)
++			property = le32_to_cpu(resp->intval.property);
++			if (resp->intval.result) {
++				dev_warn_ratelimited(battmgr->dev,
++					"Oplus property %u rejected: %u\n", property,
++					le32_to_cpu(resp->intval.result));
++				battmgr->error = -EIO;
+ 				goto out_complete;
+-
+-			if (opcode == BATTMGR_OPLUS_PROPERTY_GET) {
+-				//printk("OPLUS: get property=%d value=%d result=%d\n", property, le32_to_cpu(resp->intval.value), le32_to_cpu(resp->intval.result));
+ 			}
+ 
++			if (opcode == BATTMGR_OPLUS_PROPERTY_GET)
++				battmgr->oplus.value = le32_to_cpu(resp->intval.value);
++
+ 			goto out_complete;
+ 		}
+ 	}
+@@ -1666,6 +1996,151 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+ 		qcom_battmgr_sm8350_callback(battmgr, data, len);
+ }
+ 
++/* Caller holds lock: the firmware accepts only one outstanding request. */
++static struct device *qcom_battmgr_oplus_usbss(struct qcom_battmgr *battmgr)
++{
++	struct device_node *np;
++	struct device *mux;
++
++	np = of_parse_phandle(battmgr->dev->parent->of_node,
++			      "oplus,usbss-mux", 0);
++	if (!np)
++		np = of_find_compatible_node(NULL, NULL, "qcom,wcd9390-usbss");
++	if (!np)
++		return NULL;
++
++	mux = bus_find_device_by_of_node(&i2c_bus_type, np);
++	of_node_put(np);
++	return mux;
++}
++
++static void qcom_battmgr_oplus_restore_dpdm(void *data)
++{
++	struct qcom_battmgr *battmgr = data;
++	struct device *mux;
++	int ret;
++
++	mutex_lock(&battmgr->lock);
++	if (!battmgr->oplus_dpdm_claimed)
++		goto out;
++
++	mux = qcom_battmgr_oplus_usbss(battmgr);
++	if (!mux) {
++		dev_warn(battmgr->dev, "USBSS mux is not ready; keeping DPDM claim\n");
++		goto out;
++	}
++
++	ret = wcd939x_usbss_release_handshake(mux, battmgr->dev);
++	put_device(mux);
++	if (ret) {
++		dev_warn(battmgr->dev, "failed to restore USBSS DPDM route: %d\n", ret);
++		goto out;
++	}
++
++	battmgr->oplus_dpdm_claimed = false;
++	dev_info(battmgr->dev, "restored USBSS DPDM route after charger handshake\n");
++out:
++	mutex_unlock(&battmgr->lock);
++}
++
++static void qcom_battmgr_oplus_release_dpdm(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
++						   struct qcom_battmgr,
++						   oplus_dpdm_release_work);
++
++	qcom_battmgr_oplus_restore_dpdm(battmgr);
++}
++
++static void qcom_battmgr_oplus_claim_dpdm(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr,
++						   oplus_dpdm_claim_work);
++	struct device *mux;
++	int ret;
++
++	mutex_lock(&battmgr->lock);
++	if (!READ_ONCE(battmgr->service_up) || READ_ONCE(battmgr->oplus.otg_state))
++		goto out;
++
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_GET,
++					   OPLUS_USB_TYPE, 0);
++	if (ret)
++		goto out;
++
++	/* Reserve D+/D- for USB until BC1.2 identifies a dedicated charger. */
++	if (battmgr->oplus.value != POWER_SUPPLY_USB_TYPE_DCP) {
++		if (battmgr->oplus_dpdm_claimed)
++			mod_delayed_work(system_dfl_wq, &battmgr->oplus_dpdm_release_work, 0);
++		goto out;
++	}
++
++	if (battmgr->oplus_dpdm_claimed)
++		goto reschedule;
++
++	mux = qcom_battmgr_oplus_usbss(battmgr);
++	if (!mux)
++		goto out;
++
++	ret = wcd939x_usbss_claim_handshake(mux, battmgr->dev);
++	put_device(mux);
++	if (ret) {
++		dev_dbg(battmgr->dev, "USBSS DPDM charger route not claimed: %d\n", ret);
++		goto out;
++	}
++
++	battmgr->oplus_dpdm_claimed = true;
++	dev_info(battmgr->dev, "routed USBSS DPDM to charger for attach handshake\n");
++reschedule:
++	mod_delayed_work(system_dfl_wq, &battmgr->oplus_dpdm_release_work,
++			 msecs_to_jiffies(5000));
++out:
++	mutex_unlock(&battmgr->lock);
++}
++
++/* Caller holds lock: the firmware accepts only one outstanding request. */
++static int qcom_battmgr_oplus_init_charging(struct qcom_battmgr *battmgr)
++{
++	int ret;
++
++	/*
++	 * Match oplus_chg_8350_hardware_init(): firmware may retain an input
++	 * suspend across warm boots. CHG_EN alone only enables the output.
++	 * U32_MAX is the vendor's unsuspend command, not a current request.
++	 * Keep the ordinary USB limit; negotiated higher power is separate.
++	 */
++	/* Stock enables the SoCCP PD policy before it handles charger attach. */
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
++					  OPLUS_SET_PD_ENABLE, 1);
++	if (ret)
++		return ret;
++
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_GET,
++					  OPLUS_USB_INPUT_CURRENT_LIMIT, 0);
++	if (ret)
++		return ret;
++
++	dev_info(battmgr->dev, "Oplus input limit before init: %u uA\n",
++		 battmgr->oplus.value);
++
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
++					  OPLUS_USB_INPUT_CURRENT_LIMIT, U32_MAX);
++	if (ret)
++		return ret;
++
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
++					  OPLUS_USB_INPUT_CURRENT_LIMIT, 500000);
++	if (ret)
++		return ret;
++
++	ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
++					  OPLUS_CHG_EN, 1);
++	if (!ret)
++		dev_info(battmgr->dev, "Oplus input unsuspended, 500 mA baseline enabled\n");
++
++	return ret;
++}
++
+ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ {
+ 	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr, enable_work);
+@@ -1676,15 +2151,36 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
+ 	};
+ 	int ret;
+ 
++	mutex_lock(&battmgr->lock);
+ 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
+-	if (ret)
++	if (ret) {
+ 		dev_err(battmgr->dev, "failed to request power notifications\n");
++		goto out;
++	}
+ 
+ 	if (battmgr->variant == OPLUS_BATTMGR_KAANAPALI) {
+ 		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET, OPLUS_USB_OTG_AP_ENABLE, 1);
+-		if (ret)
++		if (ret) {
+ 			dev_err(battmgr->dev, "failed to enable OTG control from AP\n");
++			goto out;
++		}
++
++		/* A RAM Ubuntu boot has no Android OTG policy; start as a sink. */
++		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET,
++					      OPLUS_USB_OTG_VBUS_REGULATOR_ENABLE, 0);
++		if (ret) {
++			dev_err(battmgr->dev, "failed to disable OTG VBUS regulator\n");
++			goto out;
++		}
++
++		if (battmgr->oplus.vooc_buck_held)
++			goto out;
++		ret = qcom_battmgr_oplus_init_charging(battmgr);
++		if (ret)
++			dev_err(battmgr->dev, "failed to initialize charger input: %d\n", ret);
+ 	}
++out:
++	mutex_unlock(&battmgr->lock);
+ }
+ 
+ static void qcom_battmgr_oplus_otg_worker(struct work_struct *work)
+@@ -1712,26 +2208,6 @@ static void qcom_battmgr_oplus_otg_worker(struct work_struct *work)
+ 	return;
+ }
+ 
+-static void qcom_battmgr_oplus_charging_worker(struct work_struct *work)
+-{
+-	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr, oplus_charging_work);
+-	int ret;
+-
+-	mutex_lock(&battmgr->lock);
+-	/* Shouldn't happen, PlugIn notification isn't sent when OTG Enable is sent. */
+-	if (!battmgr->oplus.otg_state) {
+-		ret = qcom_battmgr_request_property(battmgr, BATTMGR_OPLUS_PROPERTY_SET, OPLUS_CHG_EN, 1);
+-		if (ret) {
+-			dev_err(battmgr->dev, "failed to enable charging\n");
+-			goto out;
+-		}
+-	}
+-
+-out:
+-	mutex_unlock(&battmgr->lock);
+-	return;
+-}
+-
+ static void qcom_battmgr_pdr_notify(void *priv, int state)
+ {
+ 	struct qcom_battmgr *battmgr = priv;
+@@ -1774,6 +2250,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 		return -ENOMEM;
+ 
+ 	battmgr->dev = dev;
++	auxiliary_set_drvdata(adev, battmgr);
+ 
+ 	psy_cfg.drv_data = battmgr;
+ 	psy_cfg.fwnode = dev_fwnode(&adev->dev);
+@@ -1856,8 +2333,18 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = devm_work_autocancel(dev, &battmgr->oplus_charging_work,
+-				   qcom_battmgr_oplus_charging_worker);
++	/* Unregister the client and cancel both works before restoring the mux. */
++	ret = devm_add_action_or_reset(dev, qcom_battmgr_oplus_restore_dpdm, battmgr);
++	if (ret)
++		return ret;
++
++	ret = devm_delayed_work_autocancel(dev, &battmgr->oplus_dpdm_release_work,
++					   qcom_battmgr_oplus_release_dpdm);
++	if (ret)
++		return ret;
++
++	ret = devm_work_autocancel(dev, &battmgr->oplus_dpdm_claim_work,
++				  qcom_battmgr_oplus_claim_dpdm);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1873,6 +2360,16 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	return 0;
+ }
+ 
++static void qcom_battmgr_remove(struct auxiliary_device *adev)
++{
++	struct qcom_battmgr *battmgr = auxiliary_get_drvdata(adev);
++
++	/* The GLINK client is released before the power supplies by devres. */
++	mutex_lock(&battmgr->lock);
++	battmgr->removing = true;
++	mutex_unlock(&battmgr->lock);
++}
++
+ static const struct auxiliary_device_id qcom_battmgr_id_table[] = {
+ 	{ .name = "pmic_glink.power-supply", },
+ 	{},
+@@ -1882,6 +2379,7 @@ MODULE_DEVICE_TABLE(auxiliary, qcom_battmgr_id_table);
+ static struct auxiliary_driver qcom_battmgr_driver = {
+ 	.name = "pmic_glink_power_supply",
+ 	.probe = qcom_battmgr_probe,
++	.remove = qcom_battmgr_remove,
+ 	.id_table = qcom_battmgr_id_table,
+ };
+ 

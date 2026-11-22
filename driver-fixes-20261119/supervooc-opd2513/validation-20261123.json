@@ -1,0 +1,17 @@
+{
+  "date": "2026-11-23",
+  "model": "OPD2513",
+  "module_sha256": "a5d65b3215bf62591caea5f2442dcb0f3ad0258d4984f6478434b67474027377",
+  "build_id": "00a26bd05187a5b1157e5b6decf6440c776d88d5",
+  "measurement_point": "charge pump VBUS times sum of two pump IBUS; not charger AC input",
+  "active_samples": 98,
+  "pump_peak_W": 58.286847,
+  "pump_mean_W": 55.621398551020405,
+  "adapter_window_s": 99.50287996400039,
+  "net_charge_mAh": 263.301,
+  "start_soc": 56,
+  "end_soc": 58,
+  "connector_peak_mC": 52897,
+  "user_feedback": "Normal charging confirmed after this run",
+  "limits": "Short run only; not a full charge cycle or proof of constant 67 W. Connector 55 C, battery temperature/voltage/SOC, faults and 30 minute session protections retained. Persistence tooling prepared only; tablet installation and restart validation not performed. Cold boot not yet tested."
+}

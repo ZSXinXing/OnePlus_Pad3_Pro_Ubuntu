@@ -13,3 +13,11 @@ These patches are separate from the baseline rootfs build. Apply only to the mat
 | `opd2513-tfa9865-tdm.patch` | TFA9865 codec on the port's Linux kernel; does not include the rest of the AudioReach stack, hardware calibration or protection profiles. / 功放 TDM 改动，不包含其余音频拓扑、校准与保护配置。 |
 
 The reference kernel comes from `map220v/sm8850-mainline` at the commit pinned in the main README. The OPD2514 `iceland` work and the matching OPD2513 OnePlusOSS device tree were references, not interchangeable device releases.
+
+## SuperVOOC charging — 2026-11-23 / 快充修复
+
+- `opd2513-battmgr-powered-vooc.patch`: battery/SoCCP handoff and live capacity interfaces against kernel `b9e356dfbd7a8c70a891b0ef819ba5f5eff1774c`. / 电池与 SoCCP 交接、实时电量读取依赖。
+- `opd2513-charge-pump-i2c.patch`: board charge-pump bus and primary PHY interrupt description. / 双泵总线与主泵握手中断。
+- [Driver and verification record](../driver-fixes-20261119/supervooc-opd2513/README.md): fixes the incorrect connector 44°C derating threshold. Short-run pump peak 58.287 W, mean 55.621 W, net battery gain 263.301 mAh; user confirmed normal charging. / 修复接插件44°C错误降档，保留55°C保护；完整周期和冷启动仍待验。
+
+These patches are dependencies of the experimental board port, not a complete kernel distribution. Persistence tools are prepared but were not installed on the tablet in this publication task. / 补丁是本移植的依赖，不构成完整内核；持久化工具仅准备，本次未在平板安装。
